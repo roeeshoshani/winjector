@@ -12,8 +12,8 @@ use windows::Win32::{
     System::{
         Diagnostics::{
             Debug::{
-                GetThreadContext, InitializeContext, SetThreadContext, WriteProcessMemory, CONTEXT,
-                CONTEXT_FLAGS, CONTEXT_FULL_X86,
+                GetThreadContext, InitializeContext, ReadProcessMemory, SetThreadContext,
+                WriteProcessMemory, CONTEXT, CONTEXT_FLAGS, CONTEXT_FULL_X86,
             },
             ToolHelp::{
                 CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD,
@@ -26,7 +26,8 @@ use windows::Win32::{
         },
         Threading::{
             OpenProcess, OpenThread, ResumeThread, SuspendThread, PROCESS_VM_OPERATION,
-            PROCESS_VM_WRITE, THREAD_GET_CONTEXT, THREAD_SET_CONTEXT, THREAD_SUSPEND_RESUME,
+            PROCESS_VM_READ, PROCESS_VM_WRITE, THREAD_GET_CONTEXT, THREAD_SET_CONTEXT,
+            THREAD_SUSPEND_RESUME,
         },
     },
 };
@@ -35,6 +36,7 @@ const RESTORE_SAVED_REGS_ON_STACK_CODE: &[u8] = &[
     0x58, 0x5b, 0x59, 0x5a, 0x5d, 0x5e, 0x5f, 0x41, 0x58, 0x41, 0x59, 0x41, 0x5a, 0x41, 0x5b, 0x41,
     0x5c, 0x41, 0x5d, 0x41, 0x5e, 0x41, 0x5f, 0xc2, 0x08, 0x10,
 ];
+const SYSCALL_INSN_BYTES: &[u8] = &[0x0f, 0x05];
 
 struct HandleGuard(HANDLE);
 impl Drop for HandleGuard {
@@ -84,8 +86,12 @@ fn dll_to_shellcode(dll_path: &Path, dll_to_shellcode_path: &Path) -> anyhow::Re
 fn run_remote_shellcode(pid: u32, shellcode: &[u8]) -> anyhow::Result<()> {
     let tid = find_first_thread_of_process(pid).context("failed to find thread of process")?;
     let proc_handle = HandleGuard(unsafe {
-        OpenProcess(PROCESS_VM_OPERATION | PROCESS_VM_WRITE, false, pid)
-            .context("failed to open process")
+        OpenProcess(
+            PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ,
+            false,
+            pid,
+        )
+        .context("failed to open process")
     }?);
     println!("[*] injecting to thread with TID {}", tid);
     let shellcode_addr = allocate_shellcode_in_remote_process(&proc_handle, shellcode)?;
@@ -167,27 +173,40 @@ fn run_shellcode_in_remote_thread(
         as_raw_bytes(&restore_shellcode_addr),
     )
     .context("failed to write ret ip")?;
+    let bytes_before_rip = read_proc_memory(
+        proc_handle,
+        orig_ctx.Rip as usize - SYSCALL_INSN_BYTES.len(),
+        SYSCALL_INSN_BYTES.len(),
+    )
+    .context("failed to read bytes before rip")?;
+    let was_stopped_on_syscall = bytes_before_rip == SYSCALL_INSN_BYTES;
+    let saved_regs = SavedRegsOnStack {
+        rax: orig_ctx.Rax,
+        rbx: orig_ctx.Rbx,
+        rcx: orig_ctx.Rcx,
+        rdx: orig_ctx.Rdx,
+        rbp: orig_ctx.Rbp,
+        rsi: orig_ctx.Rsi,
+        rdi: orig_ctx.Rdi,
+        r8: orig_ctx.R8,
+        r9: orig_ctx.R9,
+        r10: orig_ctx.R10,
+        r11: orig_ctx.R11,
+        r12: orig_ctx.R12,
+        r13: orig_ctx.R13,
+        r14: orig_ctx.R14,
+        r15: orig_ctx.R15,
+        ret_ip: if was_stopped_on_syscall {
+            orig_ctx.Rip - SYSCALL_INSN_BYTES.len() as u64
+        } else {
+            orig_ctx.Rip
+        },
+    };
+    println!("[DEBUG] saved regs: {:#?}", saved_regs);
     write_proc_memory(
         proc_handle,
         shellcode_ctx.Rsp as usize + 8,
-        as_raw_bytes(&SavedRegsOnStack {
-            rax: orig_ctx.Rax,
-            rbx: orig_ctx.Rbx,
-            rcx: orig_ctx.Rcx,
-            rdx: orig_ctx.Rdx,
-            rbp: orig_ctx.Rbp,
-            rsi: orig_ctx.Rsi,
-            rdi: orig_ctx.Rdi,
-            r8: orig_ctx.R8,
-            r9: orig_ctx.R9,
-            r10: orig_ctx.R10,
-            r11: orig_ctx.R11,
-            r12: orig_ctx.R12,
-            r13: orig_ctx.R13,
-            r14: orig_ctx.R14,
-            r15: orig_ctx.R15,
-            ret_ip: orig_ctx.Rip,
-        }),
+        as_raw_bytes(&saved_regs),
     )
     .context("failed to write saved regs context to remote process")?;
 
@@ -211,6 +230,7 @@ fn as_raw_bytes<T>(value: &T) -> &[u8] {
 }
 
 #[repr(C, packed)]
+#[derive(Debug)]
 struct SavedRegsOnStack {
     rax: u64,
     rbx: u64,
@@ -247,6 +267,23 @@ fn write_proc_memory(proc_handle: &HandleGuard, addr: usize, data: &[u8]) -> any
         "not all bytes were written"
     );
     Ok(())
+}
+
+fn read_proc_memory(proc_handle: &HandleGuard, addr: usize, len: usize) -> anyhow::Result<Vec<u8>> {
+    let mut num_of_bytes_read = 0;
+    let mut buf = vec![0u8; len];
+    unsafe {
+        ReadProcessMemory(
+            proc_handle.0,
+            addr as *const c_void,
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+            Some(&mut num_of_bytes_read),
+        )
+        .context("failed to write shellcode to remote process")?
+    };
+    ensure!(num_of_bytes_read == buf.len(), "not all bytes were read");
+    Ok(buf)
 }
 
 fn alloc_remote(proc_handle: &HandleGuard, len: usize) -> anyhow::Result<usize> {
