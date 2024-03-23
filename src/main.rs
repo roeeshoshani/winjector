@@ -33,7 +33,7 @@ use windows::Win32::{
 
 const RESTORE_SAVED_REGS_ON_STACK_CODE: &[u8] = &[
     0x58, 0x5b, 0x59, 0x5a, 0x5d, 0x5e, 0x5f, 0x41, 0x58, 0x41, 0x59, 0x41, 0x5a, 0x41, 0x5b, 0x41,
-    0x5c, 0x41, 0x5d, 0x41, 0x5e, 0x41, 0x5f, 0xc2, 0x08, 0x40,
+    0x5c, 0x41, 0x5d, 0x41, 0x5e, 0x41, 0x5f, 0xc2, 0x08, 0x10,
 ];
 
 struct HandleGuard(HANDLE);
@@ -156,7 +156,7 @@ fn run_shellcode_in_remote_thread(
     let shellcode_ctx = unsafe { &mut *shellcode_ctx_ptr };
     shellcode_ctx.ContextFlags = CONTEXT_FULL_X86;
     shellcode_ctx.Rip = shellcode_addr as u64;
-    shellcode_ctx.Rsp -= 0x4008 + core::mem::size_of::<SavedRegsOnStack>() as u64 + 8;
+    shellcode_ctx.Rsp -= 0x1008 + core::mem::size_of::<SavedRegsOnStack>() as u64 + 8;
 
     let restore_shellcode_addr =
         allocate_shellcode_in_remote_process(proc_handle, RESTORE_SAVED_REGS_ON_STACK_CODE)
