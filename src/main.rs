@@ -94,7 +94,8 @@ fn run_remote_shellcode(pid: u32, shellcode: &[u8]) -> anyhow::Result<()> {
         .context("failed to open process")
     }?);
     println!("[*] injecting to thread with TID {}", tid);
-    let shellcode_addr = allocate_shellcode_in_remote_process(&proc_handle, shellcode)?;
+    let shellcode_addr = alloc_shellcode_in_remote_process(&proc_handle, shellcode)?;
+    println!("[*] dll shellcode allocated at 0x{:x}", shellcode_addr);
     run_shellcode_in_remote_thread(&proc_handle, tid, shellcode_addr)?;
     Ok(())
 }
@@ -165,8 +166,12 @@ fn run_shellcode_in_remote_thread(
     shellcode_ctx.Rsp -= 0x1008 + core::mem::size_of::<SavedRegsOnStack>() as u64 + 8;
 
     let restore_shellcode_addr =
-        allocate_shellcode_in_remote_process(proc_handle, RESTORE_SAVED_REGS_ON_STACK_CODE)
+        alloc_shellcode_in_remote_process(proc_handle, RESTORE_SAVED_REGS_ON_STACK_CODE)
             .context("failed to allocate restore shellcode in remote process")?;
+    println!(
+        "[*] restore shellcode allocated at 0x{:x}",
+        restore_shellcode_addr
+    );
     write_proc_memory(
         proc_handle,
         shellcode_ctx.Rsp as usize,
@@ -197,12 +202,13 @@ fn run_shellcode_in_remote_thread(
         r14: orig_ctx.R14,
         r15: orig_ctx.R15,
         ret_ip: if was_stopped_on_syscall {
+            println!("[*] performing syscall restoration logic");
             orig_ctx.Rip - SYSCALL_INSN_BYTES.len() as u64
         } else {
             orig_ctx.Rip
         },
     };
-    println!("[DEBUG] saved regs: {:#?}", saved_regs);
+    println!("[*] saved regs: {:#x?}", saved_regs);
     write_proc_memory(
         proc_handle,
         shellcode_ctx.Rsp as usize + 8,
@@ -296,7 +302,7 @@ fn alloc_remote(proc_handle: &HandleGuard, len: usize) -> anyhow::Result<usize> 
     Ok(allocated_addr as usize)
 }
 
-fn allocate_shellcode_in_remote_process(
+fn alloc_shellcode_in_remote_process(
     proc_handle: &HandleGuard,
     shellcode: &[u8],
 ) -> anyhow::Result<usize> {
