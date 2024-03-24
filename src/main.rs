@@ -1,4 +1,5 @@
 use std::{
+    ffi::CStr,
     os::raw::c_void,
     path::{Path, PathBuf},
     process::Command,
@@ -7,36 +8,41 @@ use std::{
 
 use anyhow::{anyhow, ensure, Context};
 use clap::Parser;
-use windows::Win32::{
-    Foundation::{CloseHandle, GetLastError, ERROR_INSUFFICIENT_BUFFER, HANDLE},
-    System::{
-        Diagnostics::{
-            Debug::{
-                GetThreadContext, InitializeContext, ReadProcessMemory, SetThreadContext,
-                WriteProcessMemory, CONTEXT, CONTEXT_FLAGS, CONTEXT_FULL_X86,
-            },
-            ToolHelp::{
-                CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD,
-                THREADENTRY32,
-            },
+use hooker::{relocate_fn_start, JumperKind, TrampolineBytes};
+use windows::{
+    core::PCSTR,
+    Win32::{
+        Foundation::{
+            CloseHandle, FreeLibrary, GetLastError, ERROR_INSUFFICIENT_BUFFER, HANDLE, HMODULE,
         },
-        Memory::{
-            VirtualAllocEx, VirtualProtectEx, MEM_COMMIT, PAGE_EXECUTE, PAGE_PROTECTION_FLAGS,
-            PAGE_READWRITE,
-        },
-        Threading::{
-            OpenProcess, OpenThread, ResumeThread, SuspendThread, PROCESS_VM_OPERATION,
-            PROCESS_VM_READ, PROCESS_VM_WRITE, THREAD_GET_CONTEXT, THREAD_SET_CONTEXT,
-            THREAD_SUSPEND_RESUME,
+        System::{
+            Diagnostics::{
+                Debug::{
+                    GetThreadContext, InitializeContext, ReadProcessMemory, SetThreadContext,
+                    WriteProcessMemory, CONTEXT, CONTEXT_FLAGS, CONTEXT_FULL_X86,
+                },
+                ToolHelp::{
+                    CreateToolhelp32Snapshot, Module32First, Module32Next, Thread32First,
+                    Thread32Next, MODULEENTRY32, TH32CS_SNAPMODULE, TH32CS_SNAPTHREAD,
+                    THREADENTRY32,
+                },
+            },
+            LibraryLoader::{GetProcAddress, LoadLibraryA},
+            Memory::{
+                VirtualAllocEx, VirtualProtectEx, MEM_COMMIT, PAGE_EXECUTE, PAGE_PROTECTION_FLAGS,
+                PAGE_READWRITE,
+            },
+            ProcessStatus::{EnumProcessModulesEx, GetModuleInformation, MODULEINFO},
+            Threading::{
+                GetCurrentProcess, OpenProcess, OpenThread, ResumeThread, SuspendThread,
+                PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE, THREAD_ACCESS_RIGHTS,
+                THREAD_GET_CONTEXT, THREAD_SET_CONTEXT, THREAD_SUSPEND_RESUME,
+            },
         },
     },
 };
 
-const RESTORE_SAVED_REGS_ON_STACK_CODE: &[u8] = &[
-    0x58, 0x5b, 0x59, 0x5a, 0x5d, 0x5e, 0x5f, 0x41, 0x58, 0x41, 0x59, 0x41, 0x5a, 0x41, 0x5b, 0x41,
-    0x5c, 0x41, 0x5d, 0x41, 0x5e, 0x41, 0x5f, 0xc2, 0x08, 0x10,
-];
-const SYSCALL_INSN_BYTES: &[u8] = &[0x0f, 0x05];
+const TRAMPOLINE_CODE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/trampoline"));
 
 struct HandleGuard(HANDLE);
 impl Drop for HandleGuard {
@@ -48,6 +54,8 @@ impl Drop for HandleGuard {
 #[derive(Debug, Parser)]
 struct Cli {
     pid: u32,
+    hook_fn_module_name: String,
+    hook_fn_name: String,
     dll_path: PathBuf,
     dll_to_shellcode_path: Option<PathBuf>,
 }
@@ -59,10 +67,101 @@ fn main() -> anyhow::Result<()> {
     let dll_to_shellcode_path = cli
         .dll_to_shellcode_path
         .unwrap_or_else(|| DEFAULT_DLL_TO_SHELLCODE_PATH.into());
+    let hook_fn_info =
+        find_fn_in_remote_process(cli.pid, &cli.hook_fn_module_name, &cli.hook_fn_name)?;
     let shellcode = dll_to_shellcode(&cli.dll_path, &dll_to_shellcode_path)
         .context("failed to convert dll to shellcode")?;
-    run_remote_shellcode(cli.pid, &shellcode).context("failed to run shellcode")?;
+    run_remote_shellcode(cli.pid, &shellcode, hook_fn_info).context("failed to run shellcode")?;
     Ok(())
+}
+
+struct LibraryGuard(HMODULE);
+impl Drop for LibraryGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = FreeLibrary(self.0);
+        }
+    }
+}
+
+fn str_to_cstr_bytes(s: &str) -> Vec<u8> {
+    let mut bytes = s.as_bytes().to_vec();
+    bytes.push(0);
+    bytes
+}
+
+struct FoundFnInfo {
+    addr: usize,
+    max_size: usize,
+}
+
+fn find_fn_in_remote_process(
+    pid: u32,
+    module_name: &str,
+    fn_name: &str,
+) -> anyhow::Result<FoundFnInfo> {
+    let remote_mod_addr =
+        find_addr_of_module_in_remote_process(pid, module_name).context(format!(
+            "failed to find address of module {} in remote process",
+            module_name,
+        ))?;
+    let module_name_cstr_bytes = str_to_cstr_bytes(module_name);
+    let lib = LibraryGuard(unsafe {
+        LoadLibraryA(PCSTR(module_name_cstr_bytes.as_ptr()))
+            .context(format!("failed to load library {}", module_name))?
+    });
+    let fn_name_cstr_bytes = str_to_cstr_bytes(fn_name);
+    let local_fn_addr = unsafe { GetProcAddress(lib.0, PCSTR(fn_name_cstr_bytes.as_ptr().cast())) }
+        .context(format!(
+            "function {} does not exist in module {}",
+            fn_name, module_name
+        ))?;
+    let mut mod_info: MODULEINFO = unsafe { core::mem::zeroed() };
+    unsafe {
+        GetModuleInformation(
+            GetCurrentProcess(),
+            lib.0,
+            &mut mod_info,
+            core::mem::size_of_val(&mod_info) as u32,
+        )
+        .context("failed to get module information")?;
+    };
+    let local_mod_addr = mod_info.lpBaseOfDll;
+    let local_mod_end_addr = local_mod_addr as usize + mod_info.SizeOfImage as usize;
+    Ok(FoundFnInfo {
+        addr: local_fn_addr as usize - local_mod_addr as usize + remote_mod_addr,
+        max_size: local_mod_end_addr - local_fn_addr as usize,
+    })
+}
+
+fn find_addr_of_module_in_remote_process(pid: u32, module_name: &str) -> anyhow::Result<usize> {
+    let snapshot = HandleGuard(unsafe {
+        CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, pid)
+            .context("failed to create process modules snapshot")?
+    });
+    let mut mod_entry: MODULEENTRY32 = unsafe { core::mem::zeroed() };
+    mod_entry.dwSize = core::mem::size_of::<MODULEENTRY32>() as u32;
+    unsafe {
+        Module32First(snapshot.0, &mut mod_entry)
+            .context("failed to get first thread in threads snapshot")?
+    };
+    loop {
+        let Ok(mod_entry_name) = unsafe { CStr::from_ptr(mod_entry.szModule.as_ptr()) }.to_str()
+        else {
+            continue;
+        };
+        if mod_entry_name.eq_ignore_ascii_case(module_name) {
+            return Ok(mod_entry.modBaseAddr as usize);
+        }
+        if unsafe { Module32Next(snapshot.0, &mut mod_entry).is_err() } {
+            break;
+        }
+    }
+    Err(anyhow!(
+        "module {} not found in module list of process with pid {}",
+        module_name,
+        pid
+    ))
 }
 
 fn dll_to_shellcode(dll_path: &Path, dll_to_shellcode_path: &Path) -> anyhow::Result<Vec<u8>> {
@@ -83,8 +182,13 @@ fn dll_to_shellcode(dll_path: &Path, dll_to_shellcode_path: &Path) -> anyhow::Re
     std::fs::read(&shellcode_path).context("failed to read dll to shellcode output file")
 }
 
-fn run_remote_shellcode(pid: u32, shellcode: &[u8]) -> anyhow::Result<()> {
-    let tid = find_first_thread_of_process(pid).context("failed to find thread of process")?;
+fn run_remote_shellcode(
+    pid: u32,
+    shellcode: &[u8],
+    hook_fn_info: FoundFnInfo,
+) -> anyhow::Result<()> {
+    let threads = open_threads_of_process(pid, THREAD_SUSPEND_RESUME)
+        .context("failed to find thread of process")?;
     let proc_handle = HandleGuard(unsafe {
         OpenProcess(
             PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ,
@@ -93,169 +197,119 @@ fn run_remote_shellcode(pid: u32, shellcode: &[u8]) -> anyhow::Result<()> {
         )
         .context("failed to open process")
     }?);
-    println!("[*] injecting to thread with TID {}", tid);
+
+    let hook_fn_content = read_proc_memory(&proc_handle, hook_fn_info.addr, hook_fn_info.max_size)?;
+
+    // relocate the start of the function and build a hook trampoline so that we can call the original function
+    let relocated_fn_start = relocate_fn_start(
+        &hook_fn_content,
+        hook_fn_info.addr as u64,
+        JumperKind::Long.size_in_bytes(),
+    )
+    .context("failed to relocate the start of the hooked function")?;
+    let hook_tramp_addr = alloc_remote(&proc_handle, relocated_fn_start.trampoline_size())
+        .context("failed to allocate hook trampoline")?;
+    let hook_tramp_bytes = relocated_fn_start.build_trampoline(hook_tramp_addr as u64);
+    write_proc_memory(&proc_handle, hook_tramp_addr, &hook_tramp_bytes)
+        .context("failed to write hook trampoline")?;
+    make_mem_prot_exec_remote(&proc_handle, hook_tramp_addr, hook_tramp_bytes.len())
+        .context("failed to make hook tramp executable")?;
+
+    // allocate the shellcode
     let shellcode_addr = alloc_shellcode_in_remote_process(&proc_handle, shellcode)?;
-    println!("[*] dll shellcode allocated at 0x{:x}", shellcode_addr);
-    run_shellcode_in_remote_thread(&proc_handle, tid, shellcode_addr)?;
+
+    // build the injection trampoline
+    let injection_tramp_global_var_addr =
+        alloc_remote(&proc_handle, 8).context("failed to allocate trampoline global var")?;
+    let injection_tramp_bytes = build_injection_trampoline(
+        injection_tramp_global_var_addr,
+        shellcode_addr,
+        hook_tramp_addr,
+    );
+
+    // allocate the injection trampoline
+    let injection_tramp_addr =
+        alloc_shellcode_in_remote_process(&proc_handle, &injection_tramp_bytes)
+            .context("failed to allocate injection tramp")?;
+
+    // finally, write the jumper to make it jump to the injection tramp
+
+    println!("[*] suspending threads");
+    for thread in &threads {
+        suspend_thread(thread).context("failed to suspend thread")?;
+    }
+
+    println!("[*] writing jumper");
+    let jumper = JumperKind::Long.build(hook_fn_info.addr as u64, injection_tramp_addr as u64);
+    println!("jumper bytes: {:02x?}", jumper);
+    write_proc_memory(&proc_handle, hook_fn_info.addr, &jumper)
+        .context("failed to write jumper")?;
+
+    println!("[*] resuming threads");
+    for thread in &threads {
+        resume_thread(thread).context("failed to suspend thread")?;
+    }
+
     Ok(())
 }
 
-fn get_context_size(flags: CONTEXT_FLAGS) -> anyhow::Result<usize> {
-    let mut ctx_buf_size = 0;
-    let err = unsafe {
-        InitializeContext(None, flags, null_mut(), &mut ctx_buf_size)
-            .err()
-            .context("the context initialization unexpectedly succeeded with an empty buffer")?
-    };
-
-    if unsafe { GetLastError() } != ERROR_INSUFFICIENT_BUFFER {
-        return Err(err)
-            .context("the context initialization function failed with an unknown error");
-    }
-    Ok(ctx_buf_size as usize)
-}
-
-fn initialize_context(flags: CONTEXT_FLAGS) -> anyhow::Result<(Vec<u8>, *mut CONTEXT)> {
-    let ctx_size = get_context_size(flags)?;
-    let mut ctx_buf = vec![0u8; ctx_size];
-    let mut ctx_ptr = null_mut();
-    let mut ctx_length = ctx_buf.len() as u32;
-    unsafe {
-        InitializeContext(
-            Some(ctx_buf.as_mut_ptr().cast()),
-            flags,
-            &mut ctx_ptr,
-            &mut ctx_length,
-        )
-        .context("failed to initialize context")?;
-    };
-    let ctx_buf_ptr_range = ctx_buf.as_ptr()..unsafe { ctx_buf.as_ptr().add(ctx_size) };
-    assert!(ctx_buf_ptr_range.contains(&ctx_ptr.cast::<u8>().cast_const()));
-    Ok((ctx_buf, ctx_ptr))
-}
-
-fn run_shellcode_in_remote_thread(
-    proc_handle: &HandleGuard,
-    tid: u32,
-    shellcode_addr: usize,
-) -> anyhow::Result<()> {
-    let thread_handle = HandleGuard(unsafe {
-        OpenThread(
-            THREAD_SET_CONTEXT | THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME,
-            false,
-            tid,
-        )
-        .context("failed to open thread")?
-    });
-    println!("[*] suspending thread");
+fn suspend_thread(thread_handle: &HandleGuard) -> windows::core::Result<()> {
     let res = unsafe { SuspendThread(thread_handle.0) };
     if res == u32::MAX {
-        return Err(windows::core::Error::from_win32()).context("failed to suspend thread");
-    }
-
-    let (orig_ctx_buf, orig_ctx_ptr) = initialize_context(CONTEXT_FULL_X86)?;
-    let orig_ctx = unsafe { &mut *orig_ctx_ptr };
-    orig_ctx.ContextFlags = CONTEXT_FULL_X86;
-    unsafe { GetThreadContext(thread_handle.0, orig_ctx).context("failed to get thread context")? };
-
-    let (mut shellcode_ctx_buf, shellcode_ctx_ptr) = initialize_context(CONTEXT_FULL_X86)?;
-    shellcode_ctx_buf.copy_from_slice(&orig_ctx_buf);
-    let shellcode_ctx = unsafe { &mut *shellcode_ctx_ptr };
-    shellcode_ctx.ContextFlags = CONTEXT_FULL_X86;
-    shellcode_ctx.Rip = shellcode_addr as u64;
-    shellcode_ctx.Rsp -= 0x1008 + core::mem::size_of::<SavedRegsOnStack>() as u64 + 8;
-
-    let restore_shellcode_addr =
-        alloc_shellcode_in_remote_process(proc_handle, RESTORE_SAVED_REGS_ON_STACK_CODE)
-            .context("failed to allocate restore shellcode in remote process")?;
-    println!(
-        "[*] restore shellcode allocated at 0x{:x}",
-        restore_shellcode_addr
-    );
-    write_proc_memory(
-        proc_handle,
-        shellcode_ctx.Rsp as usize,
-        as_raw_bytes(&restore_shellcode_addr),
-    )
-    .context("failed to write ret ip")?;
-    let bytes_before_rip = read_proc_memory(
-        proc_handle,
-        orig_ctx.Rip as usize - SYSCALL_INSN_BYTES.len(),
-        SYSCALL_INSN_BYTES.len(),
-    )
-    .context("failed to read bytes before rip")?;
-    let was_stopped_on_syscall = bytes_before_rip == SYSCALL_INSN_BYTES;
-    let saved_regs = SavedRegsOnStack {
-        rax: orig_ctx.Rax,
-        rbx: orig_ctx.Rbx,
-        rcx: orig_ctx.Rcx,
-        rdx: orig_ctx.Rdx,
-        rbp: orig_ctx.Rbp,
-        rsi: orig_ctx.Rsi,
-        rdi: orig_ctx.Rdi,
-        r8: orig_ctx.R8,
-        r9: orig_ctx.R9,
-        r10: orig_ctx.R10,
-        r11: orig_ctx.R11,
-        r12: orig_ctx.R12,
-        r13: orig_ctx.R13,
-        r14: orig_ctx.R14,
-        r15: orig_ctx.R15,
-        ret_ip: if was_stopped_on_syscall {
-            println!("[*] performing syscall restoration logic");
-            orig_ctx.Rip - SYSCALL_INSN_BYTES.len() as u64
-        } else {
-            orig_ctx.Rip
-        },
-    };
-    println!("[*] saved regs: {:#x?}", saved_regs);
-    write_proc_memory(
-        proc_handle,
-        shellcode_ctx.Rsp as usize + 8,
-        as_raw_bytes(&saved_regs),
-    )
-    .context("failed to write saved regs context to remote process")?;
-
-    println!("[*] setting rip to 0x{:x}", shellcode_addr as u64);
-    unsafe {
-        SetThreadContext(thread_handle.0, shellcode_ctx).context("failed to set thread context")?
-    };
-
-    println!("[*] resuming thread");
-    let res = unsafe { ResumeThread(thread_handle.0) };
-    if res == u32::MAX {
-        return Err(windows::core::Error::from_win32()).context("failed to resume thread");
+        return Err(windows::core::Error::from_win32());
     }
     Ok(())
 }
 
-fn as_raw_bytes<T>(value: &T) -> &[u8] {
-    unsafe {
-        core::slice::from_raw_parts(value as *const T as *const u8, core::mem::size_of::<T>())
+fn resume_thread(thread_handle: &HandleGuard) -> windows::core::Result<()> {
+    let res = unsafe { ResumeThread(thread_handle.0) };
+    if res == u32::MAX {
+        return Err(windows::core::Error::from_win32());
     }
+    Ok(())
 }
 
-#[repr(C, packed)]
-#[derive(Debug)]
-struct SavedRegsOnStack {
-    rax: u64,
-    rbx: u64,
-    rcx: u64,
-    rdx: u64,
-    rbp: u64,
-    rsi: u64,
-    rdi: u64,
-    r8: u64,
-    r9: u64,
-    r10: u64,
-    r11: u64,
-    r12: u64,
-    r13: u64,
-    r14: u64,
-    r15: u64,
-    ret_ip: u64,
+fn build_injection_trampoline(
+    global_var_addr: usize,
+    shellcode_addr: usize,
+    hook_trampoline_addr: usize,
+) -> Vec<u8> {
+    let mut trampoline = TRAMPOLINE_CODE.to_vec();
+    assert!(bytes_find_and_replace_usize(
+        &mut trampoline,
+        0x1111111111111111,
+        global_var_addr
+    ));
+    assert!(bytes_find_and_replace_usize(
+        &mut trampoline,
+        0x2222222222222222,
+        shellcode_addr
+    ));
+    assert!(bytes_find_and_replace_usize(
+        &mut trampoline,
+        0x3333333333333333,
+        hook_trampoline_addr
+    ));
+    trampoline
 }
 
+/// returns whether the pattern was found and replaced.
+fn bytes_find_and_replace(bytes: &mut [u8], pattern: &[u8], replacement: &[u8]) -> bool {
+    assert_eq!(pattern.len(), replacement.len());
+    for i in 0..bytes.len() - pattern.len() {
+        let window = &mut bytes[i..i + pattern.len()];
+        if window == pattern {
+            window.copy_from_slice(replacement);
+            return true;
+        }
+    }
+    false
+}
+
+/// returns whether the pattern was found and replaced.
+fn bytes_find_and_replace_usize(bytes: &mut [u8], pattern: usize, replacement: usize) -> bool {
+    bytes_find_and_replace(bytes, &pattern.to_ne_bytes(), &replacement.to_ne_bytes())
+}
 fn write_proc_memory(proc_handle: &HandleGuard, addr: usize, data: &[u8]) -> anyhow::Result<()> {
     let mut num_of_bytes_written = 0;
     unsafe {
@@ -307,25 +361,36 @@ fn alloc_shellcode_in_remote_process(
     shellcode: &[u8],
 ) -> anyhow::Result<usize> {
     let allocated_addr = alloc_remote(proc_handle, shellcode.len())?;
-
     write_proc_memory(proc_handle, allocated_addr, shellcode)
         .context("failed to write shellcode to remote process")?;
+    make_mem_prot_exec_remote(proc_handle, allocated_addr, shellcode.len())
+        .context("failed to make shellcode executable")?;
+    Ok(allocated_addr)
+}
 
+fn make_mem_prot_exec_remote(
+    proc_handle: &HandleGuard,
+    addr: usize,
+    len: usize,
+) -> anyhow::Result<()> {
     let mut old_prot = PAGE_PROTECTION_FLAGS(0);
     unsafe {
         VirtualProtectEx(
             proc_handle.0,
-            allocated_addr as *const c_void,
-            shellcode.len(),
+            addr as *const c_void,
+            len,
             PAGE_EXECUTE,
             &mut old_prot,
         )
-        .context("failed to make shellcode memory executable in the remote process")?
+        .context("failed to make memory executable in the remote process")?
     };
-    Ok(allocated_addr)
+    Ok(())
 }
 
-fn find_first_thread_of_process(pid: u32) -> anyhow::Result<u32> {
+fn open_threads_of_process(
+    pid: u32,
+    desired_access: THREAD_ACCESS_RIGHTS,
+) -> anyhow::Result<Vec<HandleGuard>> {
     let snapshot = HandleGuard(unsafe {
         CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0)
             .context("failed to create threads snapshot")?
@@ -336,13 +401,17 @@ fn find_first_thread_of_process(pid: u32) -> anyhow::Result<u32> {
         Thread32First(snapshot.0, &mut thread)
             .context("failed to get first thread in threads snapshot")?
     };
+    let mut result = Vec::new();
     loop {
         if thread.th32OwnerProcessID == pid {
-            return Ok(thread.th32ThreadID);
+            result.push(HandleGuard(unsafe {
+                OpenThread(desired_access, false, thread.th32ThreadID)
+                    .context("failed to open thread")?
+            }));
         }
         if unsafe { Thread32Next(snapshot.0, &mut thread).is_err() } {
             break;
         }
     }
-    Err(anyhow!("no threads belong to pid {}", pid))
+    Ok(result)
 }
