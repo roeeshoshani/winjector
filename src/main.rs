@@ -3,24 +3,19 @@ use std::{
     os::raw::c_void,
     path::{Path, PathBuf},
     process::Command,
-    ptr::null_mut,
+    time::Duration,
 };
 
 use anyhow::{anyhow, ensure, Context};
 use clap::Parser;
-use hooker::{relocate_fn_start, JumperKind, TrampolineBytes};
+use hooker::{relocate_fn_start, JumperKind};
 use windows::{
     core::PCSTR,
     Win32::{
-        Foundation::{
-            CloseHandle, FreeLibrary, GetLastError, ERROR_INSUFFICIENT_BUFFER, HANDLE, HMODULE,
-        },
+        Foundation::{CloseHandle, FreeLibrary, HANDLE, HMODULE},
         System::{
             Diagnostics::{
-                Debug::{
-                    GetThreadContext, InitializeContext, ReadProcessMemory, SetThreadContext,
-                    WriteProcessMemory, CONTEXT, CONTEXT_FLAGS, CONTEXT_FULL_X86,
-                },
+                Debug::{ReadProcessMemory, WriteProcessMemory},
                 ToolHelp::{
                     CreateToolhelp32Snapshot, Module32First, Module32Next, Thread32First,
                     Thread32Next, MODULEENTRY32, TH32CS_SNAPMODULE, TH32CS_SNAPTHREAD,
@@ -32,11 +27,11 @@ use windows::{
                 VirtualAllocEx, VirtualProtectEx, MEM_COMMIT, PAGE_EXECUTE, PAGE_PROTECTION_FLAGS,
                 PAGE_READWRITE,
             },
-            ProcessStatus::{EnumProcessModulesEx, GetModuleInformation, MODULEINFO},
+            ProcessStatus::{GetModuleInformation, MODULEINFO},
             Threading::{
                 GetCurrentProcess, OpenProcess, OpenThread, ResumeThread, SuspendThread,
                 PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE, THREAD_ACCESS_RIGHTS,
-                THREAD_GET_CONTEXT, THREAD_SET_CONTEXT, THREAD_SUSPEND_RESUME,
+                THREAD_SUSPEND_RESUME,
             },
         },
     },
@@ -54,22 +49,33 @@ impl Drop for HandleGuard {
 #[derive(Debug, Parser)]
 struct Cli {
     pid: u32,
-    hook_fn_module_name: String,
-    hook_fn_name: String,
-    dll_path: PathBuf,
+    dll_path: Option<PathBuf>,
+    hook_fn_full_name: Option<String>,
     dll_to_shellcode_path: Option<PathBuf>,
 }
 
 const DEFAULT_DLL_TO_SHELLCODE_PATH: &str = "C:/users/sho/Documents/DllToShellCode.exe";
+const DEFAULT_INJECTED_DLL_PATH: &str =
+    "C:/Users/sho/Documents/maple_cheats/injected/target/debug/injected.dll";
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    let dll_path = cli
+        .dll_path
+        .unwrap_or_else(|| DEFAULT_INJECTED_DLL_PATH.into());
     let dll_to_shellcode_path = cli
         .dll_to_shellcode_path
         .unwrap_or_else(|| DEFAULT_DLL_TO_SHELLCODE_PATH.into());
-    let hook_fn_info =
-        find_fn_in_remote_process(cli.pid, &cli.hook_fn_module_name, &cli.hook_fn_name)?;
-    let shellcode = dll_to_shellcode(&cli.dll_path, &dll_to_shellcode_path)
+    let hook_fn_full_name = cli
+        .hook_fn_full_name
+        .as_ref()
+        .map(|string| string.as_str())
+        .unwrap_or("kernelbase.dll:WaitForSingleObjectEx");
+    let (hook_fn_module_name, hook_fn_name) = hook_fn_full_name
+        .split_once(':')
+        .context("hook fn name must be of the form <MODULE NAME>:<FUNCTION NAME>")?;
+    let hook_fn_info = find_fn_in_remote_process(cli.pid, &hook_fn_module_name, &hook_fn_name)?;
+    let shellcode = dll_to_shellcode(&dll_path, &dll_to_shellcode_path)
         .context("failed to convert dll to shellcode")?;
     run_remote_shellcode(cli.pid, &shellcode, hook_fn_info).context("failed to run shellcode")?;
     Ok(())
@@ -241,9 +247,41 @@ fn run_remote_shellcode(
 
     println!("[*] writing jumper");
     let jumper = JumperKind::Long.build(hook_fn_info.addr as u64, injection_tramp_addr as u64);
-    println!("jumper bytes: {:02x?}", jumper);
     write_proc_memory(&proc_handle, hook_fn_info.addr, &jumper)
         .context("failed to write jumper")?;
+
+    println!("[*] resuming threads");
+    for thread in &threads {
+        resume_thread(thread).context("failed to suspend thread")?;
+    }
+
+    // wait for our hook to be called
+    println!("[*] waiting for hook to be called");
+    loop {
+        std::thread::sleep(Duration::from_millis(200));
+        let global_var_bytes = read_proc_memory(&proc_handle, injection_tramp_global_var_addr, 8)
+            .context("failed to read injection tramp global var")?;
+        let is_zero = global_var_bytes.iter().all(|byte| *byte == 0);
+        if !is_zero {
+            // if the global var was written, our hook was called, so we can remove it now.
+            break;
+        }
+    }
+
+    println!("[*] hook was called and dll was injected, removing hook");
+
+    println!("[*] suspending threads");
+    for thread in &threads {
+        suspend_thread(thread).context("failed to suspend thread")?;
+    }
+
+    println!("[*] overwriting jumper with original content");
+    write_proc_memory(
+        &proc_handle,
+        hook_fn_info.addr,
+        &hook_fn_content[..JumperKind::Long.size_in_bytes()],
+    )
+    .context("failed to overwrite jumper with original content")?;
 
     println!("[*] resuming threads");
     for thread in &threads {
