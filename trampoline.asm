@@ -28,7 +28,11 @@ push r15
 
 ; address of the shellcode
 mov rax, 0x2222222222222222
+
+; the loader fucks with the stack, so reserve some space
+sub rsp, 0x1000
 call rax
+add rsp, 0x1000
 
 pop r15
 pop r14
